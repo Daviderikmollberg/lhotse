@@ -40,7 +40,7 @@ def download_samromur(
 
     # Determine which parts to download
     if part == "all":
-        parts = ["train", "validation", "test"]
+        parts = ["train", "dev", "test"]
     else:
         parts = [part]
 
@@ -100,7 +100,7 @@ def download_samromur(
 
 def load_metadata(
     corpus_dir: Pathlike,
-    part: Literal["train", "validation", "test"] = "train",
+    part: Literal["train", "dev", "test"] = "train",
 ) -> List[Dict]:
     """
     Load metadata from the Samromur dataset.
@@ -215,14 +215,15 @@ def prepare_samromur(
 
     return result
 
+    # Example usage
 
-# Example usage
-# if __name__ == "__main__":
-#     # First download the dataset
-#     download_samromur(
-#         target_dir=Path("data"),
-#         part="test",
-#     )
+
+if __name__ == "__main__":
+    #     # First download the dataset
+    download_samromur(
+        target_dir=Path("/home/dem/projects/k2/data"),
+    )
+
 
 #     # Then prepare the manifests
 #     prepare_samromur(
