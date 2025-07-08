@@ -95,3 +95,4 @@ from .wenet_speech import *
 from .wenetspeech4tts import *
 from .xbmu_amdo31 import *
 from .yesno import *
+from .samromur import *
