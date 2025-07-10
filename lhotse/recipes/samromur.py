@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Dict, Literal, Optional, Tuple, Union, List
 import re
 from tqdm import tqdm
+import glob
 
 from lhotse.audio import Recording, RecordingSet
 from lhotse.qa import fix_manifests, validate_recordings_and_supervisions
@@ -225,18 +226,288 @@ def _download_malromur(
     return {part: part_dir}
 
 
+def _download_althingi(
+    part: str, target_dir: Pathlike, force_download: bool, remove_archive: bool
+) -> Dict[str, Path]:
+    """
+    Download the Althingi dataset from Hugging Face.
+
+    :param part: Which part(s) of the dataset to download ("train", "dev", "test", or "all")
+    :param target_dir: Directory where the dataset will be downloaded
+    :param force_download: If True, force redownload even if files exist
+    :param remove_archive: If True, remove the downloaded archive files after extraction
+    :return: Dictionary mapping parts to their directory paths
+    """
+    downloaded_parts = {}
+    dataset_name = "althingi"
+
+    _validate_parts(part, ["train", "dev", "test", "all"])
+    if part == "all":
+        parts = ["train", "dev", "test"]
+    else:
+        parts = [part]
+
+    base_url = "https://huggingface.co/datasets/language-and-voice-lab/althingi_asr/resolve/main"
+    repo_base_url = "https://repository.clarin.is/repository/xmlui/bitstream/handle/20.500.12537/277"
+
+    # First, download the original text archive to get the unnormalized text
+    target_dir = Path(target_dir)
+    althingi_dir = target_dir / dataset_name
+    althingi_dir.mkdir(parents=True, exist_ok=True)
+
+    # Check if we already have the text archive extracted
+    original_text_dir = althingi_dir / "malfong"
+    original_text_completed = original_text_dir / ".completed"
+
+    if not original_text_completed.is_file() or force_download:
+        original_text_dir.mkdir(parents=True, exist_ok=True)
+        if original_text_dir.exists():
+            shutil.rmtree(original_text_dir, ignore_errors=True)
+        original_text_dir.mkdir(parents=True, exist_ok=True)
+
+        # Download the original text archive
+        original_text_archive = althingi_dir / "althingi_texti.tar.gz"
+        original_text_url = f"{repo_base_url}/althingi_texti.tar.gz"
+
+        logging.info(f"Downloading original text archive to {original_text_archive}")
+        resumable_download(
+            original_text_url,
+            filename=original_text_archive,
+            force_download=force_download,
+        )
+
+        # Extract the text archive
+        logging.info("Extracting original text archive...")
+        with tarfile.open(original_text_archive) as tar:
+            safe_extract(tar, path=althingi_dir)
+
+        # Mark as completed
+        original_text_completed.touch()
+
+        if remove_archive:
+            original_text_archive.unlink(missing_ok=True)
+
+    # Now process each part
+    for p in tqdm(parts, desc="Downloading Althingi parts"):
+        part_dir = althingi_dir / p
+        completed_detector = part_dir / ".completed"
+
+        # if completed_detector.is_file() and not force_download:
+        #     logging.info(
+        #         f"Skipping {p} part of {dataset_name} because {completed_detector} exists."
+        #     )
+        #     downloaded_parts[p] = part_dir
+        #     continue
+
+        # Create and clear the part directory
+        part_dir.mkdir(parents=True, exist_ok=True)
+
+        # Copy the original text files for this part
+        orig_part_files_dir = original_text_dir / p
+        if orig_part_files_dir.exists():
+            for file in ["spk2gender", "text"]:
+                src_file = orig_part_files_dir / file
+                if src_file.exists():
+                    dst_file = part_dir / file
+                    shutil.copy2(src_file, dst_file)
+                    logging.info(f"Copied original {file} for part {p}")
+        else:
+            logging.warning(
+                f"Original text directory for part {p} not found: {orig_part_files_dir}"
+            )
+
+        # Download the metadata file from Hugging Face
+        metadata_path = part_dir / "metadata.tsv"
+        metadata_url = f"{base_url}/corpus/files/metadata_{p}.tsv"
+        logging.info(f"Downloading {p} metadata to {metadata_path}")
+        resumable_download(
+            metadata_url,
+            filename=metadata_path,
+            force_download=force_download,
+        )
+
+        # Create audio directory
+        audio_dir = part_dir / "audio"
+        audio_dir.mkdir(exist_ok=True)
+
+        # Download audio files
+        if p == "train":
+            # Train data is split into multiple files
+            for i in tqdm(range(1, 14), desc=f"Downloading {p} audio parts"):
+                part_num = f"{i:03d}"  # Format to 001, 002, etc.
+                audio_tar_path = part_dir / f"train_part_{part_num}.tar.gz"
+                audio_url = (
+                    f"{base_url}/corpus/speech/train/train_part_{part_num}.tar.gz"
+                )
+
+                logging.info(
+                    f"Downloading train part {part_num} audio to {audio_tar_path}"
+                )
+                resumable_download(
+                    audio_url,
+                    filename=audio_tar_path,
+                    force_download=force_download,
+                )
+
+                # Extract the audio tar.gz file
+                logging.info(f"Extracting train part {part_num} audio to {part_dir}")
+                with tarfile.open(audio_tar_path) as tar:
+                    safe_extract(tar, path=part_dir)
+
+                if remove_archive:
+                    audio_tar_path.unlink(missing_ok=True)
+        else:
+            # Dev and test are single files
+            audio_tar_path = part_dir / f"{p}.tar.gz"
+            audio_url = f"{base_url}/corpus/speech/{p}.tar.gz"
+
+            logging.info(f"Downloading {p} audio to {audio_tar_path}")
+            resumable_download(
+                audio_url,
+                filename=audio_tar_path,
+                force_download=force_download,
+            )
+
+            # Extract the audio tar.gz file
+            logging.info(f"Extracting {p} audio to {part_dir}")
+            with tarfile.open(audio_tar_path) as tar:
+                safe_extract(tar, path=part_dir)
+
+            if remove_archive:
+                audio_tar_path.unlink(missing_ok=True)
+
+        # Find all flac files in the specified directory structure
+        flac_files = glob.glob(str(part_dir / p / "*" / "*" / "*.flac"))
+        logging.info(f"Found {len(flac_files)} FLAC files to process")
+
+        for flac_file in tqdm(flac_files, desc=f"Processing {p} audio files"):
+            flac_path = Path(flac_file)
+            prefixed_filename = f"{flac_path.parts[-3]}-{flac_path.name}"
+            destination = audio_dir / prefixed_filename
+            shutil.move(flac_file, destination)
+
+        logging.info(
+            f"Processed and moved {len(flac_files)} audio files to {audio_dir}"
+        )
+
+        # Create a metadata.csv file with the appropriate format for our processing functions
+        # Merge the normalized text from Hugging Face with the original text
+        _create_merged_metadata_for_althingi_data(part_dir, metadata_path)
+
+        # Mark as completed
+        completed_detector.touch()
+        downloaded_parts[p] = part_dir
+        logging.info(f"Downloaded and prepared {p} part of {dataset_name}")
+
+    return downloaded_parts
+
+
+def _create_merged_metadata_for_althingi_data(part_dir: Path, metadata_path: Path):
+    """
+    Create a merged metadata file that includes both normalized text from HuggingFace
+    and original text from the repository archive.
+
+    :param part_dir: Directory containing the downloaded part
+    :param metadata_path: Path to the metadata file from HuggingFace
+    """
+    # Load the original text file which contains the original transcripts
+    original_text_file = part_dir / "text"
+    original_texts = {}
+
+    if original_text_file.exists():
+        with open(original_text_file, "r", encoding="utf-8") as f:
+            for line in f:
+                utterance_id = line.strip().split(" ")[0]
+                text = " ".join(line.strip().split(" ")[1:])
+                utterance_id_without_spk = utterance_id.split("-")[1]
+                original_texts[utterance_id_without_spk] = {
+                    "utterance_id": utterance_id,
+                    "text": text,
+                }
+        logging.info(f"Loaded {len(original_texts)} original texts")
+    else:
+        logging.warning(f"Original text file not found: {original_text_file}")
+
+    # Load speaker gender information
+    gender_file = part_dir / "spk2gender"
+    speaker_genders = {}
+
+    if gender_file.exists():
+        with open(gender_file, "r", encoding="utf-8") as f:
+            for line in f:
+                speaker_id, gender = line.rstrip().split("\t")
+                if gender == "m":
+                    gender = "male"
+                elif gender == "f":
+                    gender = "female"
+                else:
+                    gender = "unkown"
+                speaker_genders[speaker_id] = gender
+        logging.info(f"Loaded {len(speaker_genders)} speaker gender mappings")
+    else:
+        logging.warning(f"Speaker gender file not found: {gender_file}")
+
+    # Create the merged metadata file
+    output_file = part_dir / "metadata.csv"
+
+    headers = [
+        "file_name",
+        "speaker_id",
+        "id",
+        "gender",
+        "duration",
+        "text",
+        "normalized_text",
+    ]
+
+    with open(metadata_path, "r", encoding="utf-8") as f_in, open(
+        output_file, "w", encoding="utf-8"
+    ) as f_out:
+        # Add our required headers
+        f_out.write(",".join(headers) + "\n")
+
+        # Skip the header line in the input
+        next(f_in)
+
+        for line in f_in:
+            fields = line.strip().split("\t")
+            if len(fields) < 4:
+                continue
+
+            audio_id_without_spk, _, duration, normalized_text = fields
+            audio_id_with_spk = original_texts[audio_id_without_spk]["utterance_id"]
+            speaker_id = audio_id_with_spk.split("-")[0]
+            # Get the original text if available
+            original_text = original_texts[audio_id_without_spk]["text"]
+
+            # Get gender if available
+            gender = speaker_genders.get(speaker_id)
+
+            # Format file_name to point to the extracted audio file
+            file_name = (
+                f"audio/{original_texts[audio_id_without_spk]["utterance_id"]}.flac"
+            )
+
+            # Write the merged metadata
+            f_out.write(
+                f"{file_name},{speaker_id},{audio_id_with_spk},{gender},{duration},{original_text},{normalized_text}\n"
+            )
+
+    logging.info(f"Created merged metadata file at {output_file}")
+
+
 def download_dataset(
     target_dir: Pathlike = ".",
-    dataset_name: Literal["samromur", "malromur"] = "samromur",
+    dataset_name: Literal["samromur", "malromur", "althingi"] = "samromur",
     force_download: Optional[bool] = False,
     part: Literal["train", "dev", "test", "all"] = "all",
     remove_archive: bool = False,
 ) -> Dict[str, Path]:
     """
-    Download the Samromur or Malromur dataset.
+    Download the Samromur, Malromur, or Althingi dataset.
 
     :param target_dir: Directory where the dataset will be downloaded
-    :param dataset_name: Which dataset to download ("samromur" or "malromur")
+    :param dataset_name: Which dataset to download ("samromur", "malromur", or "althingi")
     :param force_download: If True, force redownload even if files exist
     :param part: Which part(s) of the dataset to download ("train", "dev", "test", or "all")
     :param remove_archive: If True, remove the downloaded archive files after extraction to save on space
@@ -256,6 +527,11 @@ def download_dataset(
         downloaded_parts = _download_malromur(
             target_dir, force_download, remove_archive
         )
+    elif dataset_name == "althingi":
+        logging.info("Downloading Althingi dataset")
+        downloaded_parts = _download_althingi(
+            part, target_dir, force_download, remove_archive
+        )
     return downloaded_parts
 
 
@@ -265,6 +541,7 @@ def _load_metadata(
     headers: Optional[List[str]] = None,
     delimiter: str = ",",
     audio_file_key: str = "file_name",
+    audio_file_prefix: str = None,
 ) -> List[Dict]:
     """
     Load metadata from a dataset.
@@ -287,9 +564,16 @@ def _load_metadata(
         reader = csv.DictReader(
             f, fieldnames=headers if headers else None, delimiter=delimiter
         )
+
         for row in reader:
             # Add the audio file path to the item
-            row["audio_file"] = corpus_dir / part / row[audio_file_key]
+            if audio_file_prefix:
+                # If prefix is provided, join it with the audio file path
+                audio_path = audio_file_prefix / row[audio_file_key]
+                row["audio_file"] = corpus_dir / part / audio_path
+            else:
+                # If no prefix, just use the path from the metadata
+                row["audio_file"] = corpus_dir / part / row[audio_file_key]
             metadata.append(row)
 
     return metadata
@@ -505,9 +789,9 @@ def prepare_dataset(
 
 # if __name__ == "__main__":
 #     # First download the dataset
-# download_dataset(
-#     target_dir=Path("data"), dataset_name="malromur"
-# )
+download_dataset(
+    target_dir=Path("/home/dem/projects/k2/data"), dataset_name="althingi", part="dev"
+)
 
 # Then prepare the manifests
 # prepare_dataset(
