@@ -3,6 +3,8 @@ import logging
 import shutil
 import tarfile
 import zipfile
+import subprocess
+import os
 from pathlib import Path
 from typing import Dict, Literal, Optional, Tuple, Union, List
 import re
@@ -20,6 +22,20 @@ SAMROMUR_HUGGINGFACE_DATASET_URL = (
 )
 MALROMUR_DATASET_URL = "https://repository.clarin.is/repository/xmlui/bitstream/handle/20.500.12537/202/malromur.zip"
 SAMROMUR_QUERIES_URL = "https://repository.clarin.is/repository/xmlui/bitstream/handle/20.500.12537/180/samromur_queries_21.12.zip"
+SAMROMUR_CHILDREN_BASE_URL = (
+    "https://repository.clarin.is/repository/xmlui/bitstream/handle/20.500.12537/185"
+)
+SAMROMUR_CHILDREN_FILES = {
+    "dev": "https://huggingface.co/datasets/language-and-voice-lab/samromur_children/resolve/main/corpus/speech/dev.tar.gz",
+    "test": "https://huggingface.co/datasets/language-and-voice-lab/samromur_children/resolve/main/corpus/speech/test.tar.gz",
+    "train": [
+        "https://huggingface.co/datasets/language-and-voice-lab/samromur_children/resolve/main/corpus/speech/train/train_part_01.tar.gz",
+        "https://huggingface.co/datasets/language-and-voice-lab/samromur_children/resolve/main/corpus/speech/train/train_part_02.tar.gz",
+        "https://huggingface.co/datasets/language-and-voice-lab/samromur_children/resolve/main/corpus/speech/train/train_part_03.tar.gz",
+    ],
+}
+
+SAMROMUR_CHILDREN_METADATA_URL = "https://huggingface.co/datasets/DavidErikMollberg/asr_metadata/resolve/main/samromur_children_metadata_{part}.csv"
 
 
 def _validate_parts(part: str, valid_parts: List[str]) -> List[str]:
@@ -207,7 +223,7 @@ def _download_althingi(
     """
     Download the Althingi dataset from Hugging Face.
 
-    :param part: Which part(s) of the dataset to download ("train", "dev", "test", or "all")
+    :param part: Which part(s) of the dataset to download ("train", "dev", "test", "all")
     :param target_dir: Directory where the dataset will be downloaded
     :param force_download: If True, force redownload even if files exist
     :param remove_archive: If True, remove the downloaded archive files after extraction
@@ -254,12 +270,12 @@ def _download_althingi(
         part_dir = althingi_dir / p
         completed_detector = part_dir / ".download_completed"
 
-        # if completed_detector.is_file() and not force_download:
-        #     logging.info(
-        #         f"Skipping {p} part of {dataset_name} because {completed_detector} exists."
-        #     )
-        #     downloaded_parts[p] = part_dir
-        #     continue
+        if completed_detector.is_file() and not force_download:
+            logging.info(
+                f"Skipping {p} part of {dataset_name} because {completed_detector} exists."
+            )
+            downloaded_parts[p] = part_dir
+            continue
 
         part_dir.mkdir(parents=True, exist_ok=True)
 
@@ -282,11 +298,11 @@ def _download_althingi(
         metadata_path = part_dir / "metadata.tsv"
         metadata_url = f"{base_url}/corpus/files/metadata_{p}.tsv"
         logging.info(f"Downloading {p} metadata to {metadata_path}")
-        # resumable_download(
-        #     metadata_url,
-        #     filename=metadata_path,
-        #     force_download=force_download,
-        # )
+        resumable_download(
+            metadata_url,
+            filename=metadata_path,
+            force_download=force_download,
+        )
 
         audio_dir = part_dir / "audio"
         audio_dir.mkdir(exist_ok=True)
@@ -302,15 +318,15 @@ def _download_althingi(
                 logging.info(
                     f"Downloading train part {part_num} audio to {audio_tar_path}"
                 )
-                # resumable_download(
-                #     audio_url,
-                #     filename=audio_tar_path,
-                #     force_download=force_download,
-                # )
+                resumable_download(
+                    audio_url,
+                    filename=audio_tar_path,
+                    force_download=force_download,
+                )
 
                 logging.info(f"Extracting train part {part_num} audio to {part_dir}")
-                # with tarfile.open(audio_tar_path) as tar:
-                #     safe_extract(tar, path=part_dir)
+                with tarfile.open(audio_tar_path) as tar:
+                    safe_extract(tar, path=part_dir)
 
                 if remove_archive:
                     audio_tar_path.unlink(missing_ok=True)
@@ -631,20 +647,133 @@ def _create_metadata_for_samromur_queries(part_dir: Path, full_metadata_path: Pa
         logging.warning(f"Skipped {missing_audio} entries due to missing audio files")
 
 
+def _download_samromur_children(
+    part: str, target_dir: Pathlike, force_download: bool, remove_archive: bool
+) -> Dict[str, Path]:
+    """
+    Download the Samromur Children dataset from the specified URLs.
+    :param part: Which part(s) of the dataset to download ("train", "dev", "test", or "all")
+    :param target_dir: Directory where the dataset will be downloaded
+    :param force_download: If True, force redownload even if files exist
+    :param remove_archive: If True, remove the downloaded archive files after extraction
+    :return: Dictionary mapping parts to their directory paths
+    """
+    downloaded_parts = {}
+    dataset_name = "samromur_children"
+    parts = _validate_parts(part, ["train", "dev", "test", "all"])
+
+    target_dir = Path(target_dir)
+    dataset_dir = target_dir / dataset_name
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+
+    for p in tqdm(parts, desc="Downloading Samromur Children parts"):
+        part_dir = dataset_dir / p
+        completed_detector = part_dir / ".download_completed"
+
+        if completed_detector.is_file() and not force_download:
+            logging.info(
+                f"Skipping {p} part of {dataset_name} because {completed_detector} exists."
+            )
+            downloaded_parts[p] = part_dir
+            continue
+
+        part_dir.mkdir(parents=True, exist_ok=True)
+        audio_dir = part_dir / "audio"
+        audio_dir.mkdir(exist_ok=True)
+
+        metadata_url = SAMROMUR_CHILDREN_METADATA_URL.format(part=p)
+        metadata_path = part_dir / "metadata.csv"
+        logging.info(f"Downloading {p} metadata to {metadata_path}")
+        resumable_download(
+            metadata_url,
+            filename=metadata_path,
+            force_download=force_download,
+        )
+
+        if p == "train":
+            for idx, url in enumerate(SAMROMUR_CHILDREN_FILES[p], 1):
+                part_num = f"{idx:02d}"
+                audio_tar_path = part_dir / f"train_part_{part_num}.tar.gz"
+                logging.info(
+                    f"Downloading train part {part_num} audio to {audio_tar_path}"
+                )
+                resumable_download(
+                    url,
+                    filename=audio_tar_path,
+                    force_download=force_download,
+                )
+
+                logging.info(f"Extracting train part {part_num} audio to {part_dir}")
+                with tarfile.open(audio_tar_path) as tar:
+                    safe_extract(tar, path=part_dir)
+
+                if remove_archive:
+                    audio_tar_path.unlink(missing_ok=True)
+
+            extracted_files = list(part_dir.glob("**/*.flac"))
+            for flac_file in tqdm(extracted_files, desc=f"Moving {p} audio files"):
+                shutil.move(str(flac_file), str(audio_dir / flac_file.name))
+
+            shutil.rmtree(part_dir / "train_part_01", ignore_errors=True)
+            shutil.rmtree(part_dir / "train_part_02", ignore_errors=True)
+            shutil.rmtree(part_dir / "train_part_03", ignore_errors=True)
+        else:
+            audio_tar_path = part_dir / f"{p}.tar.gz"
+            logging.info(f"Downloading {p} audio to {audio_tar_path}")
+            resumable_download(
+                SAMROMUR_CHILDREN_FILES[p],
+                filename=audio_tar_path,
+                force_download=force_download,
+            )
+
+            logging.info(f"Extracting {p} audio to {part_dir}")
+            with tarfile.open(audio_tar_path) as tar:
+                safe_extract(tar, path=part_dir)
+
+            extracted_files = list(part_dir.glob("**/*.flac"))
+            for flac_file in tqdm(extracted_files, desc=f"Moving {p} audio files"):
+                shutil.move(str(flac_file), str(audio_dir / flac_file.name))
+
+            if remove_archive:
+                audio_tar_path.unlink(missing_ok=True)
+            shutil.rmtree(part_dir / p, ignore_errors=True)
+        logging.info(f"Processed and moved audio files for {p} part of {dataset_name}")
+
+        with open(metadata_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+
+        header = lines[0].strip()
+        rows = lines[1:]
+
+        with open(metadata_path, "w", encoding="utf-8") as f:
+            f.write(header + "\n")
+            for line in rows:
+                parts = line.strip().split(",")
+                f.write(",".join(parts) + "\n")
+
+        logging.info(f"Updated file paths in metadata for {p}")
+
+        completed_detector.touch()
+        downloaded_parts[p] = part_dir
+        logging.info(f"Downloaded and prepared {p} part of {dataset_name}")
+
+    return downloaded_parts
+
+
 def download_dataset(
     target_dir: Pathlike = ".",
     dataset_name: Literal[
-        "samromur", "malromur", "althingi", "samromur_queries"
+        "samromur", "malromur", "althingi", "samromur_queries", "samromur_children"
     ] = "samromur",
     force_download: Optional[bool] = False,
     part: Literal["train", "dev", "test", "all"] = "all",
     remove_archive: bool = False,
 ) -> Dict[str, Path]:
     """
-    Download the Samromur, Malromur, Althingi, or Samromur Queries dataset.
+    Download the Samromur, Malromur, Althingi, Samromur Queries, or Samromur Children dataset.
 
     :param target_dir: Directory where the dataset will be downloaded
-    :param dataset_name: Which dataset to download ("samromur", "malromur", "althingi", or "samromur_queries")
+    :param dataset_name: Which dataset to download ("samromur", "malromur", "althingi", "samromur_queries", or "samromur_children")
     :param force_download: If True, force redownload even if files exist
     :param part: Which part(s) of the dataset to download ("train", "dev", "test", or "all")
     :param remove_archive: If True, remove the downloaded archive files after extraction to save on space
@@ -672,6 +801,11 @@ def download_dataset(
     elif dataset_name == "samromur_queries":
         logging.info("Downloading Samromur Queries dataset")
         downloaded_parts = _download_samromur_queries(
+            part, target_dir, force_download, remove_archive
+        )
+    elif dataset_name == "samromur_children":
+        logging.info("Downloading Samromur Children dataset")
+        downloaded_parts = _download_samromur_children(
             part, target_dir, force_download, remove_archive
         )
     else:
@@ -1010,16 +1144,16 @@ def _prepare_samromur_queries(
 
 def prepare_dataset(
     dataset_name: Literal[
-        "samromur", "malromur", "althingi", "samromur_queries"
+        "samromur", "malromur", "althingi", "samromur_queries", "samromur_children"
     ] = "samromur",
     corpus_dir: Pathlike = "data",
     manifest_dir: Optional[Pathlike] = "data/manifests",
     part: Literal["train", "dev", "test", "all"] = "all",
 ) -> Dict[str, Dict[str, Union[RecordingSet, SupervisionSet]]]:
     """
-    Prepare manifests for the Samromur, Malromur, Althingi, or Samromur Queries dataset.
+    Prepare manifests for the Samromur, Malromur, Althingi, Samromur Queries, or Samromur Children dataset.
 
-    :param dataset_name: Which dataset to prepare ("samromur", "malromur", "althingi", or "samromur_queries")
+    :param dataset_name: Which dataset to prepare
     :param corpus_dir: Directory where the dataset has been downloaded
     :param manifest_dir: Optional directory where manifests will be stored
     :param part: Which part(s) of the dataset to prepare ("train", "dev", "test", or "all")
@@ -1031,7 +1165,6 @@ def prepare_dataset(
         manifest_dir.mkdir(parents=True, exist_ok=True)
 
     if dataset_name == "samromur":
-
         manifests = _prepare_samromur(
             corpus_dir=corpus_dir,
             manifest_dir=manifest_dir,
@@ -1055,6 +1188,13 @@ def prepare_dataset(
             manifest_dir=manifest_dir,
             part=part,
         )
+    elif dataset_name == "samromur_children":
+        manifests = _prepare_samromur_queries(  # Reuse the same preparation function
+            corpus_dir=corpus_dir,
+            manifest_dir=manifest_dir,
+            dataset_name=dataset_name,
+            part=part,
+        )
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
 
@@ -1063,16 +1203,16 @@ def prepare_dataset(
 
 if __name__ == "__main__":
     #     # First download the dataset
-    # download_dataset(
-    #     target_dir=Path("/home/dem/projects/k2/data"),
-    #     dataset_name="samromur_queries",
-    #     part="all",
-    # )
+    download_dataset(
+        target_dir=Path("/home/dem/projects/k2/data"),
+        dataset_name="samromur_children",
+        part="all",
+    )
 
     # Then prepare the manifests
-    prepare_dataset(
-        corpus_dir=Path("/home/dem/projects/k2/data"),
-        part="all",
-        dataset_name="samromur_queries",
-        manifest_dir=Path("/home/dem/projects/k2/data/manifests"),
-    )
+    # prepare_dataset(
+    #     corpus_dir=Path("/home/dem/projects/k2/data"),
+    #     part="all",
+    #     dataset_name="samromur_queries",
+    #     manifest_dir=Path("/home/dem/projects/k2/data/manifests"),
+    # )
