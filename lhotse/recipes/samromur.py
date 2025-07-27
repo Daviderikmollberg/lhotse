@@ -3,11 +3,8 @@ import logging
 import shutil
 import tarfile
 import zipfile
-import subprocess
-import os
 from pathlib import Path
 from typing import Dict, Literal, Optional, Tuple, Union, List
-import re
 from tqdm import tqdm
 import glob
 
@@ -22,9 +19,6 @@ SAMROMUR_HUGGINGFACE_DATASET_URL = (
 )
 MALROMUR_DATASET_URL = "https://repository.clarin.is/repository/xmlui/bitstream/handle/20.500.12537/202/malromur.zip"
 SAMROMUR_QUERIES_URL = "https://repository.clarin.is/repository/xmlui/bitstream/handle/20.500.12537/180/samromur_queries_21.12.zip"
-SAMROMUR_CHILDREN_BASE_URL = (
-    "https://repository.clarin.is/repository/xmlui/bitstream/handle/20.500.12537/185"
-)
 SAMROMUR_CHILDREN_FILES = {
     "dev": "https://huggingface.co/datasets/language-and-voice-lab/samromur_children/resolve/main/corpus/speech/dev.tar.gz",
     "test": "https://huggingface.co/datasets/language-and-voice-lab/samromur_children/resolve/main/corpus/speech/test.tar.gz",
@@ -34,8 +28,54 @@ SAMROMUR_CHILDREN_FILES = {
         "https://huggingface.co/datasets/language-and-voice-lab/samromur_children/resolve/main/corpus/speech/train/train_part_03.tar.gz",
     ],
 }
+METADATA_URL_BASE = "https://huggingface.co/datasets/DavidErikMollberg/asr_metadata/resolve/main/{dataset}_metadata_{part}.csv"
 
-SAMROMUR_CHILDREN_METADATA_URL = "https://huggingface.co/datasets/DavidErikMollberg/asr_metadata/resolve/main/samromur_children_metadata_{part}.csv"
+# Configuration for different datasets
+DATASET_CONFIGS = {
+    "samromur": {
+        "valid_parts": ["train", "dev", "test", "all"],
+        "text_key": "proper_nouns_cased",
+        "custom": {
+            "age": "age_range",
+            "text_orginal": "text",
+            "text_normalized": "text_normalized",
+        },
+    },
+    "malromur": {
+        "valid_parts": ["train"],
+        "text_key": "proper_nouns_cased",
+        "custom": {
+            "environment": "Environment",
+            "text_normalized": "text_normalized",
+            "text_original": "text",
+        },
+    },
+    "althingi": {
+        "valid_parts": ["train", "dev", "test", "all"],
+        "text_key": "text",
+        "custom": {
+            "original_text": "text",
+        },
+    },
+    "samromur_queries": {
+        "valid_parts": ["train", "dev", "test", "all"],
+        "text_key": "proper_nouns_cased",
+        "custom": {
+            "age": "age_range",
+            "text_orginal": "text",
+            "text_normalized": "text_normalized",
+        },
+    },
+    "samromur_children": {
+        "valid_parts": ["train", "dev", "test", "all"],
+        "text_key": "proper_nouns_cased",
+        "custom": {
+            "age": "age_range",
+            "text_orginal": "text",
+            "text_normalized": "text_normalized",
+        },
+    },
+}
 
 
 def _validate_parts(part: str, valid_parts: List[str]) -> List[str]:
@@ -95,8 +135,10 @@ def _download_samromur(
             force_download=force_download,
         )
 
+        metadata_url = METADATA_URL_BASE.format(part=p, dataset=dataset_name)
         metadata_path = part_dir / "metadata.csv"
-        metadata_url = f"{SAMROMUR_HUGGINGFACE_DATASET_URL}/{p}/metadata.csv"
+        if not part_dir.exists():
+            part_dir.mkdir(parents=True, exist_ok=True)
         logging.info(f"Downloading {p} metadata to {metadata_path}")
         resumable_download(
             metadata_url,
@@ -104,22 +146,10 @@ def _download_samromur(
             force_download=force_download,
         )
 
-        with open(part_dir / "metadata.csv", "r", encoding="utf-8") as f:
-            content = f.readlines()
-
-        header = content[0].strip().split(",")
-        content = content[1:]
-        header = header[0:1] + ["speaker_id"] + header[2:]
-
-        with open(part_dir / "metadata.csv", "w", encoding="utf-8") as f:
-            f.write(",".join(header) + "\n")
-            for line in content:
-                f.write(line)
-        logging.info(f"Downloaded and prepared {part} part of {dataset_name}")
-
         logging.info(f"Extracting {p} audio to {part_dir}")
         with tarfile.open(audio_tar_path) as tar:
             safe_extract(tar, path=part_dir)
+        logging.info(f"Downloaded and prepared {part} part of {dataset_name}")
 
         completed_detector.touch()
         downloaded_parts[p] = part_dir
@@ -165,51 +195,18 @@ def _download_malromur(
         force_download=force_download,
     )
 
-    logging.info(f"Extracting Malromur dataset to {part_dir}")
-    with zipfile.ZipFile(malromur_zip_path, "r") as zip_ref:
-        correct_files = [f for f in zip_ref.namelist() if f.startswith("correct/")]
+    metadata_url = METADATA_URL_BASE.format(part=part, dataset=dataset_name)
+    metadata_path = part_dir / "metadata.csv"
+    if not part_dir.exists():
+        part_dir.mkdir(parents=True, exist_ok=True)
+    logging.info(f"Downloading {part} metadata to {metadata_path}")
+    resumable_download(
+        metadata_url,
+        filename=metadata_path,
+        force_download=force_download,
+    )
 
-        for file in tqdm(correct_files, desc="Extracting audio files"):
-            zip_ref.extract(file, path=part_dir)
-
-        correct_dir = part_dir / "correct"
-        if correct_dir.exists():
-            if audio_dir.exists():
-                shutil.rmtree(audio_dir)
-            correct_dir.rename(audio_dir)
-
-        metadata_source_file = "info.txt"
-        zip_ref.extract(metadata_source_file, path=part_dir)
-
-        header = [
-            "file_name",
-            "speaker_id",
-            "id",
-            "environment",
-            "unk",
-            "gender",
-            "age_range",
-            "text",
-            "duration",
-            "classification",
-        ]
-        logging.info(f"Extracting metadata")
-        with open(part_dir / "info.txt", "r", encoding="utf-8") as f_in, open(
-            part_dir / "metadata.csv", "w", encoding="utf-8"
-        ) as f_out:
-            f_out.write(",".join(header) + "\n")
-            for line in f_in:
-                if line.split(",")[-1].strip() != "correct":
-                    continue
-                id = line.split(",")[0].strip()
-                audio_file_name = Path("audio") / (id + ".wav")
-                speaker_id = id.split("T")[0]
-                f_out.write(f"{audio_file_name},{speaker_id}," + line)
-
-            logging.info(f"Downloaded and prepared {part} part of {dataset_name}")
-        shutil.rmtree(part_dir / "info.txt", ignore_errors=True)
-
-        completed_detector.touch()
+    completed_detector.touch()
 
     if remove_archive:
         malromur_zip_path.unlink(missing_ok=True)
@@ -472,7 +469,7 @@ def _download_samromur_queries(
     """
     Download the Samromur Queries dataset from the CLARIN repository.
 
-    :param part: Which part(s) of the dataset to download ("train", "dev", "test", or "all")
+    :param part: Which part(s) of the dataset to download ("train", "dev", "test", "all")
     :param target_dir: Directory where the dataset will be downloaded
     :param force_download: If True, force redownload even if files exist
     :param remove_archive: If True, remove the downloaded archive files after extraction
@@ -540,111 +537,23 @@ def _download_samromur_queries(
 
     for p in parts:
         part_dir = dataset_dir / p
-        if part_dir.exists() and (part_dir / "audio").exists():
-            _create_metadata_for_samromur_queries(part_dir, full_metadata_path)
-            downloaded_parts[p] = part_dir
-            logging.info(f"Prepared {p} part of {dataset_name}")
-            completed_detector.touch()
 
-        else:
-            logging.warning(
-                f"Part directory {part_dir} does not exist or has no audio directory."
-            )
+        metadata_url = METADATA_URL_BASE.format(part=p, dataset=dataset_name)
+        metadata_path = part_dir / "metadata.csv"
+        if not part_dir.exists():
+            part_dir.mkdir(parents=True, exist_ok=True)
+        logging.info(f"Downloading {p} metadata to {metadata_path}")
+        resumable_download(
+            metadata_url,
+            filename=metadata_path,
+            force_download=force_download,
+        )
+
+        downloaded_parts[p] = part_dir
+        logging.info(f"Prepared {p} part of {dataset_name}")
+        completed_detector.touch()
 
     return downloaded_parts
-
-
-def _create_metadata_for_samromur_queries(part_dir: Path, full_metadata_path: Path):
-    """
-    Create a metadata.csv file for the Samromur Queries dataset by parsing
-    the main metadata file and filtering by the 'status' column.
-
-    :param part_dir: Directory containing the part data (train, dev, test)
-    :param full_metadata_path: Path to the full metadata.tsv file
-    """
-    metadata_path = part_dir / "metadata.csv"
-    audio_dir = part_dir / "audio"
-    part_name = part_dir.name
-
-    if metadata_path.exists():
-        logging.info(
-            f"Metadata file {metadata_path} already exists, skipping creation."
-        )
-        return
-
-    # Get available audio files for validation
-    available_audio_files = {f.stem for f in audio_dir.glob("*.flac")}
-    logging.info(f"Found {len(available_audio_files)} audio files in {audio_dir}")
-
-    # CSV headers for output file
-    csv_headers = [
-        "file_name",
-        "speaker_id",
-        "id",
-        "text",
-        "text_no_punct",
-        "text_normalized",
-        "gender",
-        "age",
-        "duration",
-    ]
-
-    matching_entries = 0
-    missing_audio = 0
-
-    with open(full_metadata_path, "r", encoding="utf-8") as f_in, open(
-        metadata_path, "w", encoding="utf-8", newline=""
-    ) as f_out:
-        writer = csv.writer(f_out)
-        writer.writerow(csv_headers)
-
-        header = f_in.readline().strip().split("\t")
-        col_idx = {name: idx for idx, name in enumerate(header)}
-
-        for line in tqdm(f_in, desc=f"Processing metadata for {part_name}"):
-            fields = line.strip().split("\t")
-
-            if fields[col_idx["status"]] != part_name:
-                continue
-
-            filename = fields[col_idx["filename"]]
-            if filename.split(".")[0] not in available_audio_files:
-                missing_audio += 1
-                continue
-
-            speaker_id = fields[col_idx["speaker_id"]]
-            utterance_id = fields[col_idx["id"]]
-
-            row = [
-                f"audio/{filename}",
-                speaker_id,
-                f"{speaker_id}-{utterance_id}",
-                fields[col_idx["sentence"]],
-                re.sub(
-                    r"[^\w\s]", "", fields[col_idx["sentence"]]
-                ),  # Remove punctuation
-                fields[col_idx["sentence_norm"]],
-                (
-                    "unknown"
-                    if fields[col_idx["gender"]] == "NAN"
-                    else fields[col_idx["gender"]]
-                ),
-                (
-                    "unknown"
-                    if fields[col_idx["age"]] == "NAN"
-                    else fields[col_idx["age"]]
-                ),
-                fields[col_idx["duration"]],
-            ]
-
-            writer.writerow(row)
-            matching_entries += 1
-
-    logging.info(
-        f"Created metadata file at {metadata_path} with {matching_entries} entries"
-    )
-    if missing_audio > 0:
-        logging.warning(f"Skipped {missing_audio} entries due to missing audio files")
 
 
 def _download_samromur_children(
@@ -681,7 +590,7 @@ def _download_samromur_children(
         audio_dir = part_dir / "audio"
         audio_dir.mkdir(exist_ok=True)
 
-        metadata_url = SAMROMUR_CHILDREN_METADATA_URL.format(part=p)
+        metadata_url = METADATA_URL_BASE.format(part=p, dataset=dataset_name)
         metadata_path = part_dir / "metadata.csv"
         logging.info(f"Downloading {p} metadata to {metadata_path}")
         resumable_download(
@@ -739,20 +648,6 @@ def _download_samromur_children(
             shutil.rmtree(part_dir / p, ignore_errors=True)
         logging.info(f"Processed and moved audio files for {p} part of {dataset_name}")
 
-        with open(metadata_path, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-
-        header = lines[0].strip()
-        rows = lines[1:]
-
-        with open(metadata_path, "w", encoding="utf-8") as f:
-            f.write(header + "\n")
-            for line in rows:
-                parts = line.strip().split(",")
-                f.write(",".join(parts) + "\n")
-
-        logging.info(f"Updated file paths in metadata for {p}")
-
         completed_detector.touch()
         downloaded_parts[p] = part_dir
         logging.info(f"Downloaded and prepared {p} part of {dataset_name}")
@@ -789,7 +684,7 @@ def download_dataset(
         )
     elif dataset_name == "malromur":
         logging.info("Downloading Malromur dataset")
-        _validate_parts(part, ["train", "all"])
+        _validate_parts(part, ["train"])
         downloaded_parts = _download_malromur(
             target_dir, force_download, remove_archive
         )
@@ -899,25 +794,30 @@ def _prepare(
     return recordings, supervisions
 
 
-def _prepare_samromur(
+def _prepare_dataset(
     corpus_dir: Pathlike,
     manifest_dir: Optional[Pathlike] = None,
     dataset_name: str = "samromur",
     part: Literal["train", "dev", "test", "all"] = "all",
 ) -> Dict[str, Dict[str, Union[RecordingSet, SupervisionSet]]]:
     """
-    Prepare the Samromur dataset by creating manifests from downloaded data.
+    Prepare any supported dataset by creating manifests from downloaded data.
 
     :param corpus_dir: Directory where the dataset has been downloaded
     :param manifest_dir: Optional directory where manifests will be stored
-    :param part: Which part(s) of the dataset to prepare ("train", "dev", "test", "all")
+    :param dataset_name: Name of the dataset to prepare
+    :param part: Which part(s) of the dataset to prepare ("train", "dev", "test", or "all")
     :return: Dictionary with dataset parts and their recording/supervision sets
     """
-    parts_to_process = _validate_parts(part, ["train", "dev", "test", "all"])
+    config = DATASET_CONFIGS.get(dataset_name)
+    if not config:
+        raise ValueError(f"Unknown dataset: {dataset_name}")
+
+    parts_to_process = _validate_parts(part, config["valid_parts"])
 
     result = {}
     for p in parts_to_process:
-        logging.info(f"Preparing {p} part of the Samromur dataset")
+        logging.info(f"Preparing {p} part of the {dataset_name} dataset")
 
         if not (corpus_dir / p).exists():
             logging.warning(
@@ -929,198 +829,12 @@ def _prepare_samromur(
 
         recordings, supervisions = _prepare(
             metadata=metadata,
-            text_key="text_no_punct",
+            text_key=config["text_key"],
             audio_file_path_key="audio_file",
             audio_id_key="id",
             gender_key="gender",
             speaker_key="speaker_id",
-            custom={
-                "age": "age_range",
-                "text_orginal": "text",
-                "text_normalized": "text_normalized",
-            },
-        )
-
-        recording_set = RecordingSet.from_recordings(recordings)
-        supervision_set = SupervisionSet.from_segments(supervisions)
-        recording_set, supervision_set = fix_manifests(recording_set, supervision_set)
-        validate_recordings_and_supervisions(recording_set, supervision_set)
-
-        if manifest_dir is not None:
-            supervision_set.to_file(
-                manifest_dir / f"{dataset_name}_supervisions_{p}.jsonl"
-            )
-            recording_set.to_file(manifest_dir / f"{dataset_name}_recordings_{p}.jsonl")
-
-        result[p] = {
-            "recordings": recording_set,
-            "supervisions": supervision_set,
-        }
-
-    return result
-
-
-def _prepare_malromur(
-    corpus_dir: Pathlike,
-    manifest_dir: Optional[Pathlike] = None,
-    dataset_name: str = "malromur",
-    part: Literal["train", "all"] = "all",
-) -> Dict[str, Dict[str, Union[RecordingSet, SupervisionSet]]]:
-    """
-    Prepare the Malromur dataset by creating manifests from downloaded data.
-
-    :param corpus_dir: Directory where the dataset has been downloaded
-    :param manifest_dir: Optional directory where manifests will be stored
-    :param part: Which part(s) of the dataset to prepare ("train" or "all")
-    :return: Dictionary with dataset parts and their recording/supervision sets
-    """
-    parts_to_process = _validate_parts(part, ["train", "all"])
-    if not parts_to_process:
-        return {}
-    part_to_process = parts_to_process[0]
-
-    logging.info(f"Preparing {part_to_process} part of the Malromur dataset")
-
-    if not (corpus_dir / part_to_process).exists():
-        logging.warning(
-            f"Part {part_to_process} does not exist in {corpus_dir}, skipping preparation."
-        )
-        return {}
-    metadata = _load_metadata(corpus_dir=corpus_dir, part=part_to_process)
-
-    recordings, supervisions = _prepare(
-        metadata=metadata,
-        text_key="text",
-        audio_file_path_key="audio_file",
-        audio_id_key="id",
-        gender_key="gender",
-        speaker_key="speaker_id",
-        custom={
-            "environment": "Environment",
-        },
-    )
-
-    recording_set = RecordingSet.from_recordings(recordings)
-    supervision_set = SupervisionSet.from_segments(supervisions)
-    recording_set, supervision_set = fix_manifests(recording_set, supervision_set)
-    validate_recordings_and_supervisions(recording_set, supervision_set)
-
-    if manifest_dir is not None:
-        supervision_set.to_file(
-            manifest_dir / f"{dataset_name}_supervisions_{part_to_process}.jsonl"
-        )
-        recording_set.to_file(
-            manifest_dir / f"{dataset_name}_recordings_{part_to_process}.jsonl"
-        )
-
-    result = {}
-    result[part_to_process] = {
-        "recordings": recording_set,
-        "supervisions": supervision_set,
-    }
-
-    return result
-
-
-def _prepare_althingi(
-    corpus_dir: Pathlike,
-    manifest_dir: Optional[Pathlike] = None,
-    dataset_name: str = "althingi",
-    part: Literal["train", "dev", "test", "all"] = "all",
-) -> Dict[str, Dict[str, Union[RecordingSet, SupervisionSet]]]:
-    """
-    Prepare the Althingi dataset by creating manifests from downloaded data.
-
-    :param corpus_dir: Directory where the dataset has been downloaded
-    :param manifest_dir: Optional directory where manifests will be stored
-    :param part: Which part(s) of the dataset to prepare ("train", "dev", "test", "all")
-    :return: Dictionary with dataset parts and their recording/supervision sets
-    """
-    parts_to_process = _validate_parts(part, ["train", "dev", "test", "all"])
-
-    result = {}
-    for p in parts_to_process:
-        logging.info(f"Preparing {p} part of the Althingi dataset")
-
-        if not (corpus_dir / p).exists():
-            logging.warning(
-                f"Part {p} does not exist in {corpus_dir}, skipping preparation."
-            )
-            continue
-
-        metadata = _load_metadata(corpus_dir=corpus_dir, part=p)
-
-        recordings, supervisions = _prepare(
-            metadata=metadata,
-            text_key="normalized_text",
-            audio_file_path_key="audio_file",
-            audio_id_key="id",
-            gender_key="gender",
-            speaker_key="speaker_id",
-            custom={
-                "original_text": "text",
-            },
-        )
-
-        recording_set = RecordingSet.from_recordings(recordings)
-        supervision_set = SupervisionSet.from_segments(supervisions)
-        recording_set, supervision_set = fix_manifests(recording_set, supervision_set)
-        validate_recordings_and_supervisions(recording_set, supervision_set)
-
-        if manifest_dir is not None:
-            supervision_set.to_file(
-                manifest_dir / f"{dataset_name}_supervisions_{p}.jsonl"
-            )
-            recording_set.to_file(manifest_dir / f"{dataset_name}_recordings_{p}.jsonl")
-
-        result[p] = {
-            "recordings": recording_set,
-            "supervisions": supervision_set,
-        }
-
-    return result
-
-
-def _prepare_samromur_queries(
-    corpus_dir: Pathlike,
-    manifest_dir: Optional[Pathlike] = None,
-    dataset_name: str = "samromur_queries",
-    part: Literal["train", "dev", "test", "all"] = "all",
-) -> Dict[str, Dict[str, Union[RecordingSet, SupervisionSet]]]:
-    """
-    Prepare the Samromur dataset by creating manifests from downloaded data.
-
-    :param corpus_dir: Directory where the dataset has been downloaded
-    :param manifest_dir: Optional directory where manifests will be stored
-    :param part: Which part(s) of the dataset to prepare ("train", "dev", "test", "all")
-    :return: Dictionary with dataset parts and their recording/supervision sets
-    """
-    parts_to_process = _validate_parts(part, ["train", "dev", "test", "all"])
-
-    result = {}
-    for p in parts_to_process:
-        logging.info(f"Preparing {p} part of the Samromur dataset")
-
-        if not (corpus_dir / p).exists():
-            logging.warning(
-                f"Part {p} does not exist in {corpus_dir}, skipping preparation."
-            )
-            continue
-
-        metadata = _load_metadata(corpus_dir=corpus_dir, part=p)
-
-        recordings, supervisions = _prepare(
-            metadata=metadata,
-            text_key="text_no_punct",
-            audio_file_path_key="audio_file",
-            audio_id_key="id",
-            gender_key="gender",
-            speaker_key="speaker_id",
-            custom={
-                "age": "age_range",
-                "text_orginal": "text",
-                "text_normalized": "text_normalized",
-            },
+            custom=config.get("custom", {}),
         )
 
         recording_set = RecordingSet.from_recordings(recordings)
@@ -1164,55 +878,26 @@ def prepare_dataset(
     if manifest_dir is not None:
         manifest_dir.mkdir(parents=True, exist_ok=True)
 
-    if dataset_name == "samromur":
-        manifests = _prepare_samromur(
-            corpus_dir=corpus_dir,
-            manifest_dir=manifest_dir,
-            part=part,
-        )
-    elif dataset_name == "malromur":
-        manifests = _prepare_malromur(
-            corpus_dir=corpus_dir,
-            manifest_dir=manifest_dir,
-            part=part,
-        )
-    elif dataset_name == "althingi":
-        manifests = _prepare_althingi(
-            corpus_dir=corpus_dir,
-            manifest_dir=manifest_dir,
-            part=part,
-        )
-    elif dataset_name == "samromur_queries":
-        manifests = _prepare_samromur_queries(
-            corpus_dir=corpus_dir,
-            manifest_dir=manifest_dir,
-            part=part,
-        )
-    elif dataset_name == "samromur_children":
-        manifests = _prepare_samromur_queries(  # Reuse the same preparation function
-            corpus_dir=corpus_dir,
-            manifest_dir=manifest_dir,
-            dataset_name=dataset_name,
-            part=part,
-        )
-    else:
-        raise ValueError(f"Unknown dataset: {dataset_name}")
-
-    return manifests
-
-
-if __name__ == "__main__":
-    #     # First download the dataset
-    download_dataset(
-        target_dir=Path("/home/dem/projects/k2/data"),
-        dataset_name="samromur_children",
-        part="all",
+    return _prepare_dataset(
+        corpus_dir=corpus_dir,
+        manifest_dir=manifest_dir,
+        dataset_name=dataset_name,
+        part=part,
     )
 
-    # Then prepare the manifests
-    # prepare_dataset(
-    #     corpus_dir=Path("/home/dem/projects/k2/data"),
-    #     part="all",
-    #     dataset_name="samromur_queries",
-    #     manifest_dir=Path("/home/dem/projects/k2/data/manifests"),
-    # )
+
+# if __name__ == "__main__":
+#     # First download the dataset
+# download_dataset(
+#     target_dir=Path("/home/dem/projects/k2/data"),
+#     dataset_name="samromur",
+#     part="dev",
+# )
+
+# Then prepare the manifests
+# prepare_dataset(
+#     corpus_dir=Path("/home/dem/projects/k2/data"),
+#     part="dev",
+#     dataset_name="samromur",
+#     manifest_dir=Path("/home/dem/projects/k2/data/manifests"),
+# )
