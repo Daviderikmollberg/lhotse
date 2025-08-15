@@ -42,6 +42,9 @@ def samromur(
 
     The downloaded data includes audio files and corresponding metadata.
     """
+    if dataset_name == "malromur" and part != "train":
+        raise ValueError("Malromur dataset only has a 'train' part.")
+
     download_dataset(
         target_dir=target_dir,
         dataset_name=dataset_name,
